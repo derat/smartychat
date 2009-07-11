@@ -7,6 +7,7 @@ require 'xmpp4r/iq'
 require 'xmpp4r/message'
 require 'xmpp4r/presence'
 require 'xmpp4r/roster'
+require 'yaml'
 
 AUTHFILE = "#{ENV['HOME']}/.smartychat_auth"
 
@@ -23,7 +24,10 @@ class User
   def initialize(client, jid, nick=nil)
     @client = client
     @jid = jid
-    @nick = (nick or jid)
+    @nick = nick or jid
+    if @nick == jid and /^[^@]+/ =~ jid
+      @nick = $1
+    end
     @channel = nil
     @welcome_sent = false
   end
@@ -51,6 +55,25 @@ class User
       "*/join* before you can start chatting."
     send_message(usage)
     send_message("Send */help* if you're stuck.")
+    @welcome_sent = true
+  end
+
+  def serialize
+    {
+      'jid' => @jid,
+      'nick' => @nick,
+      'channel_name' => (@channel ? @channel.name : nil),
+    }
+  end
+
+  def deserialize(chat, struct)
+    @jid = struct['jid']
+    @nick = struct['nick']
+    @channel = nil
+    if struct['channel_name']
+      @channel = chat.get_channel(struct['channel_name'], false)
+      @channel.add_user(self) if @channel
+    end
     @welcome_sent = true
   end
 end
@@ -86,6 +109,19 @@ class Channel
 
   def broadcast_message(text)
     @users.each {|u| u.send_message(text) }
+  end
+
+  def serialize
+    {
+      'name' => @name,
+      'password' => @password,
+    }
+  end
+
+  def deserialize(chat, struct)
+    @name = struct['name']
+    @password = struct['password']
+    @users.clear
   end
 end
 
@@ -151,6 +187,18 @@ class SmartyChat
     return nil
   end
 
+  def serialize
+    channels = []
+    @channels.values.each do |c|
+      channels << c.serialize
+    end
+
+    users = []
+    @users.values.each do |u|
+      users << u.serialize
+    end
+  end
+
   def handle_presence(presence)
     puts "got presence: #{presence}"
   end
@@ -162,7 +210,7 @@ class SmartyChat
 
   def handle_message(message)
     puts "got message: #{message}"
-    return if message.type == :error
+    return if message.type == :error or not message.body
 
     user = get_user(message.from)
 
