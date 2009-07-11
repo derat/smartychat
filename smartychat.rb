@@ -28,6 +28,17 @@ class User
     @welcome_sent = false
   end
 
+  def fullname
+    return @jid if @nick == @jid
+    "#@nick (#@jid)"
+  end
+
+  def change_nick(new_nick)
+    return false if not new_nick =~ /^[-_.a-zA-Z0-9]+$/
+    @nick = new_nick
+    return true
+  end
+
   def send_message(body)
     msg = Jabber::Message.new(@jid, body)
     msg.type = :chat
@@ -57,18 +68,16 @@ class Channel
 
   def add_user(user)
     return if @users.include?(user)
-    broadcast_message("_#{user.nick} has joined #{name}_")
     @users << user
   end
 
   def remove_user(user)
     return if not @users.include?(user)
     @users.delete(user)
-    broadcast_message("_#{user.nick} has left #{name}_")
   end
 
   def repeat_message(sender, body)
-    text = "[#{sender.nick}]: #{body}"
+    text = "_#{sender.nick}:_ #{body}"
     @users.each do |u|
       next if u == sender
       u.send_message(text)
@@ -103,9 +112,11 @@ class SmartyChat
     @channels = {}
 
     @commands = {
-      'help' => HelpCommand.new(self),
-      'join' => JoinCommand.new(self),
-      'part' => PartCommand.new(self),
+      'alias' => AliasCommand,
+      'help'  => HelpCommand,
+      'join'  => JoinCommand,
+      'list'  => ListCommand,
+      'part'  => PartCommand,
     }
   end
 
@@ -130,14 +141,21 @@ class SmartyChat
         @channels[name] = channel
       end
     end
-    return channel
+    channel
+  end
+
+  def get_user_with_nick(nick)
+    @users.values.each do |u|
+      return u if u.nick == nick
+    end
+    return nil
   end
 
   def handle_presence(presence)
     puts "got presence: #{presence}"
   end
 
-  def handle_subcription_request(item, presence)
+  def handle_subscription_request(item, presence)
     puts "got subscription request from #{presence.from}"
     @roster.accept_subscription(presence.from)
   end
@@ -157,7 +175,7 @@ class SmartyChat
         if not user.welcome_sent
           user.send_welcome
         else
-          user.send_message('You need to join a channel first.')
+          user.send_message('_You need to join a channel first_')
         end
       end
     end
@@ -165,47 +183,70 @@ class SmartyChat
 
   def handle_command(user, text)
     if not %r!^/([a-z]+)\s*(.*)! =~ text
-      user.send_message('Unparsable command.  Try */help*.')
+      user.send_message('_Unparsable command; try */help*_')
       return
     end
 
     cmd_name, arg = $1, $2
     cmd = @commands[cmd_name]
     if cmd
-      cmd.run(user, arg)
+      cmd.new(self, user, arg).run
     else
-      user.send_message('Unknown command _#{cmd_name}_.  Try */help*.')
+      user.send_message("_Unknown command \"#{cmd_name}\"; try */help*_")
     end
   end
 
   class Command
-    def initialize(chat)
+    def initialize(chat, user, arg)
       @chat = chat
+      @user = user
+      @arg = arg
     end
 
-    def run(user, arg)
+    def run
     end
 
-    def error(user, text)
-      user.send_message("Error: #{text}")
+    def status(text)
+      @user.send_message('_' + text + '_')
     end
+  end
 
-    def status(user, text)
-      user.send_message(text)
+  class AliasCommand < Command
+    def run
+      parts = CSV::parse_line(@arg, ' ')
+      if parts.size != 1
+        status("*/alias* requires 1 argument; got #{parts.size}")
+        return
+      end
+
+      existing_user = @chat.get_user_with_nick(parts[0])
+      if existing_user
+        status("Alias \"#{parts[0]}\" already in use by #{existing_user.jid}")
+        return
+      end
+
+      oldname = @user.fullname
+      if @user.change_nick(parts[0])
+        if @user.channel
+          @user.channel.broadcast_message("_#{oldname} is now known as #{@user.nick}_")
+        end
+      else
+        status("Invalid alias \"#{parts[0]}\"")
+      end
     end
   end
 
   class HelpCommand < Command
-    def run(user, arg)
-      user.send_message('Help isn\'t written yet. :-(')
+    def run
+      @user.send_message('Help isn\'t written yet. :-(')
     end
   end
 
   class JoinCommand < Command
-    def run(user, arg)
-      parts = CSV::parse_line(arg, ' ')
+    def run
+      parts = CSV::parse_line(@arg, ' ')
       if parts.empty? or parts.size > 2
-        error("*/join* requires 1 or 2 arguments; got #{parts.size}")
+        status("*/join* requires 1 or 2 arguments; got #{parts.size}")
         return
       end
 
@@ -216,28 +257,63 @@ class SmartyChat
       if not channel
         channel = @chat.get_channel(name, true)
         channel.password = password
-        status(user, "Created channel _#{name}_")
+        status("Created channel #{name}")
       end
 
       if channel.password and password != channel.password
-        error(user, "Incorrect or missing password for channel _#{name}_")
+        status("Incorrect or missing password for channel #{name}")
         return
       end
 
-      if user.channel == channel
-        error(user, "Already a member of channel _#{name}_")
+      if @user.channel == channel
+        status("Already a member of channel #{name}")
         return
       end
 
-      channel.add_user(user)
-      user.channel = channel
+      PartCommand.new(@chat, @user, '').run if @user.channel
+      channel.broadcast_message(
+        "_#{@user.fullname} has joined #{channel.name}_")
+      channel.add_user(@user)
+      @user.channel = channel
 
-      status(user, "Joined channel _#{name}_ with #{channel.users.size} user" +
-             (channel.users.size == 1 ? "" : "s"))
+      status("Joined channel #{name} with #{channel.users.size} user" +
+             (channel.users.size == 1 ? '' : 's'))
+    end
+  end
+
+  class ListCommand < Command
+    def run
+      channel = @user.channel
+      if not channel
+        status("Not currently in a channel")
+        return
+      end
+
+      out = "#{channel.users.size} user" +
+        (channel.users.size == 1 ? '' : 's') +
+        " in #{channel.name}:\n"
+      channel.users.each do |u|
+        out += "* #{u.fullname}\n"
+      end
+
+      @user.send_message(out)
     end
   end
 
   class PartCommand < Command
+    def run
+      channel = @user.channel
+      if not channel
+        status("Not currently in a channel")
+        return
+      end
+
+      channel.remove_user(@user)
+      status("Left channel #{channel.name}")
+      channel.broadcast_message(
+        "_#{@user.fullname} has left #{channel.name}_")
+      @user.channel = nil
+    end
   end
 end
 
