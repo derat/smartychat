@@ -17,19 +17,91 @@ Thread.abort_on_exception = true
 Jabber::debug = true
 
 
+class MessageSender
+  def initialize(client, interval_sec=1)
+    @client = client
+    @interval_sec = interval_sec
+
+    @last_send_time = 0
+
+    # JID -> [msg1, msg2, etc.]
+    @queued_messages = {}
+    @queued_messages_mutex = Mutex.new
+    @queued_messages_condition = ConditionVariable.new
+
+    @thread = Thread.new do
+      loop do
+        send_queued_messages
+      end
+    end
+  end
+
+  def enqueue_message(jid, text)
+    puts "enqueuing message for #{jid}"
+    @queued_messages_mutex.synchronize do
+      msg_list = @queued_messages[jid]
+      if not msg_list
+        msg_list = []
+        @queued_messages[jid] = msg_list
+      end
+      msg_list << text
+    end
+
+    # Wake up send_queued_messages().
+    @queued_messages_condition.broadcast
+  end
+
+  def send_queued_messages
+    # Wait until there are some queued messages.
+    @queued_messages_mutex.synchronize do
+      break if not @queued_messages.empty?
+      loop do
+        puts 'waiting for new messages'
+        @queued_messages_condition.wait @queued_messages_mutex
+        break if not @queued_messages.empty?
+      end
+    end
+
+    # Wait a bit if we sent the previous batch recently.
+    time_to_sleep = [@interval_sec - (Time.now.to_f - @last_send_time), 0].max
+    puts "sleeping #{time_to_sleep} sec before sending messages"
+    sleep(time_to_sleep)
+
+    messages = {}
+    @queued_messages_mutex.synchronize do
+      messages = @queued_messages
+      @queued_messages = {}
+    end
+
+    messages.each do |jid, list|
+      next if list.empty?
+      body = list.join("\n")
+      msg = Jabber::Message.new(jid, body)
+      msg.type = :chat
+      @client.send(msg)
+    end
+
+    @last_send_time = Time.now.to_f
+  end
+end
+
+
 class User
   attr_reader :jid, :nick, :welcome_sent
   attr_accessor :channel
 
-  def initialize(client, jid, nick=nil)
-    @client = client
+  def initialize(sender, jid, nick=nil)
+    @sender = sender
     @jid = jid
-    @nick = nick or jid
-    if @nick == jid and /^[^@]+/ =~ jid
+    @nick = (nick or jid)
+    if @nick == jid and /^([^@]+)/ =~ jid
       @nick = $1
     end
     @channel = nil
     @welcome_sent = false
+
+    @queued_messages = []
+    @queued_messages_mutex = Mutex.new
   end
 
   def fullname
@@ -43,18 +115,16 @@ class User
     return true
   end
 
-  def send_message(body)
-    msg = Jabber::Message.new(@jid, body)
-    msg.type = :chat
-    @client.send(msg)
+  def enqueue_message(text)
+    @sender.enqueue_message(@jid, text)
   end
 
   def send_welcome
     usage =
       "Welcome to SmartyChat!  You'll need to join a channel using " +
       "*/join* before you can start chatting."
-    send_message(usage)
-    send_message("Send */help* if you're stuck.")
+    enqueue_message(usage)
+    enqueue_message("Send */help* if you're stuck.")
     @welcome_sent = true
   end
 
@@ -100,15 +170,15 @@ class Channel
   end
 
   def repeat_message(sender, body)
-    text = "_#{sender.nick}:_ #{body}"
+    text = "[#{sender.nick}]: #{body}"
     @users.each do |u|
       next if u == sender
-      u.send_message(text)
+      u.enqueue_message(text)
     end
   end
 
   def broadcast_message(text)
-    @users.each {|u| u.send_message(text) }
+    @users.each {|u| u.enqueue_message(text) }
   end
 
   def serialize
@@ -154,6 +224,8 @@ class SmartyChat
       'list'  => ListCommand,
       'part'  => PartCommand,
     }
+
+    @sender = MessageSender.new(@client)
   end
 
   # Look up a user from their JID.  A new User object is created if
@@ -161,7 +233,7 @@ class SmartyChat
   def get_user(jid)
     user = @users[jid]
     if not user
-      user = User.new(@client, jid)
+      user = User.new(@sender, jid)
       @users[jid] = user
     end
     user
@@ -212,7 +284,7 @@ class SmartyChat
     puts "got message: #{message}"
     return if message.type == :error or not message.body
 
-    user = get_user(message.from)
+    user = get_user(message.from.to_s)
 
     if message.body[0,1] == '/'
       handle_command(user, message.body)
@@ -223,7 +295,7 @@ class SmartyChat
         if not user.welcome_sent
           user.send_welcome
         else
-          user.send_message('_You need to join a channel first_')
+          user.enqueue_message('_You need to join a channel first_')
         end
       end
     end
@@ -231,7 +303,7 @@ class SmartyChat
 
   def handle_command(user, text)
     if not %r!^/([a-z]+)\s*(.*)! =~ text
-      user.send_message('_Unparsable command; try */help*_')
+      user.enqueue_message('_Unparsable command; try */help*_')
       return
     end
 
@@ -240,7 +312,7 @@ class SmartyChat
     if cmd
       cmd.new(self, user, arg).run
     else
-      user.send_message("_Unknown command \"#{cmd_name}\"; try */help*_")
+      user.enqueue_message("_Unknown command \"#{cmd_name}\"; try */help*_")
     end
   end
 
@@ -255,7 +327,7 @@ class SmartyChat
     end
 
     def status(text)
-      @user.send_message('_' + text + '_')
+      @user.enqueue_message('_' + text + '_')
     end
   end
 
@@ -286,7 +358,7 @@ class SmartyChat
 
   class HelpCommand < Command
     def run
-      @user.send_message('Help isn\'t written yet. :-(')
+      @user.enqueue_message('Help isn\'t written yet. :-(')
     end
   end
 
@@ -344,7 +416,7 @@ class SmartyChat
         out += "* #{u.fullname}\n"
       end
 
-      @user.send_message(out)
+      @user.enqueue_message(out)
     end
   end
 
