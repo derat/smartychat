@@ -1,5 +1,6 @@
 #!/usr/bin/ruby
 
+require 'csv'  # for quoted-string splitting!
 require 'thread'
 require 'xmpp4r'
 require 'xmpp4r/iq'
@@ -16,7 +17,8 @@ Jabber::debug = true
 
 
 class User
-  attr_reader :jid, :nick, :channel, :welcome_sent
+  attr_reader :jid, :nick, :welcome_sent
+  attr_accessor :channel
 
   def initialize(client, jid, nick=nil)
     @client = client
@@ -44,10 +46,25 @@ end
 
 
 class Channel
-  def initialize(client, name)
-    @client = client
+  attr_reader :name, :users
+  attr_accessor :password
+
+  def initialize(name)
     @name = name
     @users = []
+    @password = nil
+  end
+
+  def add_user(user)
+    return if @users.include?(user)
+    broadcast_message("_#{user.nick} has joined #{name}_")
+    @users << user
+  end
+
+  def remove_user(user)
+    return if not @users.include?(user)
+    @users.delete(user)
+    broadcast_message("_#{user.nick} has left #{name}_")
   end
 
   def repeat_message(sender, body)
@@ -81,6 +98,15 @@ class SmartyChat
 
     # JID -> User
     @users = {}
+
+    # name -> Channel
+    @channels = {}
+
+    @commands = {
+      'help' => HelpCommand.new(self),
+      'join' => JoinCommand.new(self),
+      'part' => PartCommand.new(self),
+    }
   end
 
   # Look up a user from their JID.  A new User object is created if
@@ -92,6 +118,19 @@ class SmartyChat
       @users[jid] = user
     end
     user
+  end
+
+  def get_channel(name, create)
+    channel = @channels[name]
+    if not channel
+      if not create
+        return nil
+      else
+        channel = Channel.new(name)
+        @channels[name] = channel
+      end
+    end
+    return channel
   end
 
   def handle_presence(presence)
@@ -118,13 +157,87 @@ class SmartyChat
         if not user.welcome_sent
           user.send_welcome
         else
-          user.send_message("You need to join a channel first.")
+          user.send_message('You need to join a channel first.')
         end
       end
     end
   end
 
-  def handle_command(user, command)
+  def handle_command(user, text)
+    if not %r!^/([a-z]+)\s*(.*)! =~ text
+      user.send_message('Unparsable command.  Try */help*.')
+      return
+    end
+
+    cmd_name, arg = $1, $2
+    cmd = @commands[cmd_name]
+    if cmd
+      cmd.run(user, arg)
+    else
+      user.send_message('Unknown command _#{cmd_name}_.  Try */help*.')
+    end
+  end
+
+  class Command
+    def initialize(chat)
+      @chat = chat
+    end
+
+    def run(user, arg)
+    end
+
+    def error(user, text)
+      user.send_message("Error: #{text}")
+    end
+
+    def status(user, text)
+      user.send_message(text)
+    end
+  end
+
+  class HelpCommand < Command
+    def run(user, arg)
+      user.send_message('Help isn\'t written yet. :-(')
+    end
+  end
+
+  class JoinCommand < Command
+    def run(user, arg)
+      parts = CSV::parse_line(arg, ' ')
+      if parts.empty? or parts.size > 2
+        error("*/join* requires 1 or 2 arguments; got #{parts.size}")
+        return
+      end
+
+      name = parts[0]
+      password = (parts.size == 2 ? parts[1] : nil)
+
+      channel = @chat.get_channel(name, false)
+      if not channel
+        channel = @chat.get_channel(name, true)
+        channel.password = password
+        status(user, "Created channel _#{name}_")
+      end
+
+      if channel.password and password != channel.password
+        error(user, "Incorrect or missing password for channel _#{name}_")
+        return
+      end
+
+      if user.channel == channel
+        error(user, "Already a member of channel _#{name}_")
+        return
+      end
+
+      channel.add_user(user)
+      user.channel = channel
+
+      status(user, "Joined channel _#{name}_ with #{channel.users.size} user" +
+             (channel.users.size == 1 ? "" : "s"))
+    end
+  end
+
+  class PartCommand < Command
   end
 end
 
