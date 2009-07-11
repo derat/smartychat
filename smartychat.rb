@@ -18,7 +18,7 @@ Jabber::debug = true
 
 
 class MessageSender
-  def initialize(client, interval_sec=1)
+  def initialize(client, interval_sec=2)
     @client = client
     @interval_sec = interval_sec
 
@@ -87,8 +87,8 @@ end
 
 
 class User
-  attr_reader :jid, :nick, :welcome_sent
-  attr_accessor :channel
+  attr_reader :jid, :nick
+  attr_accessor :channel, :welcome_sent
 
   def initialize(sender, jid, nick=nil)
     @sender = sender
@@ -136,15 +136,14 @@ class User
     }
   end
 
-  def deserialize(chat, struct)
-    @jid = struct['jid']
-    @nick = struct['nick']
-    @channel = nil
+  def User.deserialize(chat, struct)
+    user = User.new(chat.sender, struct['jid'], struct['nick'])
     if struct['channel_name']
-      @channel = chat.get_channel(struct['channel_name'], false)
-      @channel.add_user(self) if @channel
+      user.channel = chat.get_channel(struct['channel_name'], false)
+      user.channel.add_user(user) if user.channel
     end
-    @welcome_sent = true
+    user.welcome_sent = true
+    user
   end
 end
 
@@ -188,15 +187,19 @@ class Channel
     }
   end
 
-  def deserialize(chat, struct)
-    @name = struct['name']
-    @password = struct['password']
-    @users.clear
+  def Channel.deserialize(chat, struct)
+    channel = Channel.new(struct['name'])
+    if struct['password'] and not struct['password'].empty?
+      channel.password = struct['password']
+    end
+    channel
   end
 end
 
 
 class SmartyChat
+  attr_accessor :sender
+
   def initialize(jid, password)
     @client = Jabber::Client.new(Jabber::JID.new(jid))
     @client.connect
@@ -259,16 +262,32 @@ class SmartyChat
     return nil
   end
 
-  def serialize
-    channels = []
-    @channels.values.each do |c|
-      channels << c.serialize
+  def serialize(file)
+    data = {
+      'channels' => @channels.values.collect {|c| c.serialize },
+      'users' => @users.values.collect {|u| u.serialize },
+    }
+    file.write(data.to_yaml)
+  end
+
+  def deserialize(file)
+    yaml = YAML.load(file)
+    return unless yaml
+
+    @users.clear
+    @channels.clear
+
+    yaml['channels'].each do |c|
+      channel = Channel.deserialize(self, c)
+      @channels[channel.name] = channel
     end
 
-    users = []
-    @users.values.each do |u|
-      users << u.serialize
+    yaml['users'].each do |u|
+      user = User.deserialize(self, u)
+      @users[user.jid] = user
     end
+
+    puts "loaded #{@channels.size} channel(s) and #{@users.size} user(s)"
   end
 
   def handle_presence(presence)
@@ -440,6 +459,16 @@ end
 
 (jid, password) = File.open(AUTHFILE) {|f| f.readline.split }
 chat = SmartyChat.new(jid, password)
+
+if File.exists?('state.yaml')
+  File.open('state.yaml', 'r') {|f| chat.deserialize(f) }
+end
+
+serialize = Proc.new do
+  puts 'serializing state'
+  File.open('state.yaml', 'w') {|f| chat.serialize(f) }
+end
+Kernel.trap('USR1', serialize)
 
 # Put the main thread in sleep mode (the parser thread will still get
 # scheduled).
