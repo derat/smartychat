@@ -266,6 +266,7 @@ class SmartyChat
       'list'   => ListCommand,
       'me'     => MeCommand,
       'part'   => PartCommand,
+      'reset'  => ResetCommand,
       'scores' => ScoresCommand,
     }
 
@@ -488,7 +489,7 @@ class SmartyChat
     end
 
     def Command.usage
-      return ['[arg1] [arg2] ...', 'Description of command.']
+      ['[arg1] [arg2] ...', 'Description of command.']
     end
   end
 
@@ -530,7 +531,7 @@ class SmartyChat
     end
 
     def AliasCommand.usage
-      return ['[name]', 'Choose a display name.']
+      ['[name]', 'Choose a display name.']
     end
   end
 
@@ -545,7 +546,7 @@ class SmartyChat
     end
 
     def HelpCommand.usage
-      return [nil, 'Display this message.']
+      [nil, 'Display this message.']
     end
   end
 
@@ -594,9 +595,8 @@ class SmartyChat
     end
 
     def JoinCommand.usage
-      return ['[name] [password]',
-              'Join a channel, creating it if it doesn\'t exist. ' +
-              'Password is optional.']
+      ['[name] [password]',
+       "Join a channel, creating it if it doesn't exist. Password is optional."]
     end
   end
 
@@ -619,7 +619,7 @@ class SmartyChat
     end
 
     def ListCommand.usage
-      return [nil, 'List users in the current channel.']
+      [nil, 'List users in the current channel.']
     end
   end
 
@@ -639,7 +639,7 @@ class SmartyChat
     end
 
     def MeCommand.usage
-      return ['[description]', 'Announce what you\'re doing.']
+      ['[description]', 'Announce what you\'re doing.']
     end
   end
 
@@ -663,7 +663,43 @@ class SmartyChat
     end
 
     def PartCommand.usage
-      return [nil, 'Leave the current channel.']
+      [nil, 'Leave the current channel.']
+    end
+  end
+
+  class ResetCommand < Command
+    def run
+      if @arg.empty?
+        status('*/reset* requires 1 argument with an optional reason')
+        return
+      end
+      thing, reason = @arg.split(' ', 2)
+
+      if not @user.channel
+        status('Not currently in a channel.')
+        return
+      end
+
+      current_score = @user.channel.scores[thing]
+      if not current_score
+        status("\"#{thing}\" doesn't have a current score in " +
+               "\"#{@user.channel.name}\".")
+        return
+      elsif current_score == 0
+        status(
+          "\"#{thing}\"'s score is already 0 in \"#{@user.channel.name}\".")
+        return
+      end
+
+      @user.channel.scores[thing] = 0
+      @chat.state_mutex.synchronize { @chat.inc_version }
+      @user.channel.broadcast_message(
+        "_*#{@user.nick}* reset #{thing}'s score to 0" +
+        (reason ? " (#{reason})" : '') + "._")
+    end
+
+    def ResetCommand.usage
+      ['[thing] [reason]', 'Reset something\'s score.  Reason is optional.']
     end
   end
 
@@ -683,7 +719,7 @@ class SmartyChat
     end
 
     def ScoresCommand.usage
-      return [nil, 'List scores in the current channel.']
+      [nil, 'List scores in the current channel.']
     end
   end
 end
