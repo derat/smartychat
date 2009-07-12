@@ -406,7 +406,7 @@ class SmartyChat
 
     @logger.info("Writing state at version #@saved_version to #@state_file")
     tmpfile = @state_file + '.tmp'
-    File.open(tmpfile, File::CREAT|File::RDWR) {|f| f.write(data) }
+    File.open(tmpfile, File::CREAT|File::RDWR, 0600) {|f| f.write(data) }
     File.rename(tmpfile, @state_file)
   end
 
