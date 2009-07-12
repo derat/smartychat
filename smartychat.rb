@@ -339,13 +339,13 @@ class SmartyChat
     data.to_yaml
   end
 
-  # Restore the chat system's state from a file.
+  # Restore the chat system's state frOm a File object.
   # Returns false on failure.
   def deserialize(file)
-    @logger.info("Deserializing #{file}")
+    @logger.info("Deserializing #{file.path}")
     yaml = YAML.load(file)
     if not yaml
-      @logger.error("Unable to parse #{file}")
+      @logger.error("Unable to parse #{file.path}")
       return false
     end
 
