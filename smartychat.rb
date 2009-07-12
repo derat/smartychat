@@ -1,6 +1,7 @@
 #!/usr/bin/ruby
 
 require 'csv'  # for quoted-string splitting!
+require 'logger'
 require 'thread'
 require 'xmpp4r'
 require 'xmpp4r/iq'
@@ -11,17 +12,15 @@ require 'yaml'
 
 AUTHFILE = "#{ENV['HOME']}/.smartychat_auth"
 
-# Crash if a thread sees an exception.
-Thread.abort_on_exception = true
-
-Jabber::debug = true
-
 
 class MessageSender
-  def initialize(client, interval_sec=2)
+  attr_accessor :logger
+
+  def initialize(client, interval_sec=2, logger=nil)
     @client = client
     @interval_sec = interval_sec
 
+    @logger = logger ? logger : Logger.new(STDOUT)
     @last_send_time = 0
 
     # JID -> [msg1, msg2, etc.]
@@ -37,7 +36,7 @@ class MessageSender
   end
 
   def enqueue_message(jid, text)
-    puts "enqueuing message for #{jid}"
+    @logger.debug("Enqueuing message for #{jid}")
     @queued_messages_mutex.synchronize do
       msg_list = @queued_messages[jid]
       if not msg_list
@@ -56,7 +55,7 @@ class MessageSender
     @queued_messages_mutex.synchronize do
       break if not @queued_messages.empty?
       loop do
-        puts 'waiting for new messages'
+        @logger.debug('Waiting for new messages')
         @queued_messages_condition.wait @queued_messages_mutex
         break if not @queued_messages.empty?
       end
@@ -64,7 +63,7 @@ class MessageSender
 
     # Wait a bit if we sent the previous batch recently.
     time_to_sleep = [@interval_sec - (Time.now.to_f - @last_send_time), 0].max
-    puts "sleeping #{time_to_sleep} sec before sending messages"
+    @logger.debug("Sleeping #{time_to_sleep} sec before sending messages")
     sleep(time_to_sleep)
 
     messages = {}
@@ -73,14 +72,20 @@ class MessageSender
       @queued_messages = {}
     end
 
+    uncondensed_messages = 0
+    condensed_messages = 0
     messages.each do |jid, list|
       next if list.empty?
+      uncondensed_messages += list.size
       body = list.join("\n")
       msg = Jabber::Message.new(jid, body)
       msg.type = :chat
       @client.send(msg)
+      condensed_messages += 1
     end
 
+    @logger.debug("Sent #{condensed_messages} message(s) " +
+                  "(#{uncondensed_messages} uncondensed)")
     @last_send_time = Time.now.to_f
   end
 end
@@ -200,7 +205,7 @@ end
 class SmartyChat
   attr_accessor :sender
 
-  def initialize(jid, password)
+  def initialize(jid, password, logger=nil)
     @client = Jabber::Client.new(Jabber::JID.new(jid))
     @client.connect
     @client.auth(password)
@@ -228,7 +233,13 @@ class SmartyChat
       'part'  => PartCommand,
     }
 
-    @sender = MessageSender.new(@client)
+    @logger = logger ? logger : Logger.new(STDOUT)
+    @sender = MessageSender.new(@client, 2, @logger)
+  end
+
+  def logger=(logger)
+    @logger = logger
+    @sender.logger = logger
   end
 
   # Look up a user from their JID.  A new User object is created if
@@ -263,6 +274,7 @@ class SmartyChat
   end
 
   def serialize(file)
+    @logger.info("Serializing to #{file}")
     data = {
       'channels' => @channels.values.collect {|c| c.serialize },
       'users' => @users.values.collect {|u| u.serialize },
@@ -271,36 +283,38 @@ class SmartyChat
   end
 
   def deserialize(file)
+    @logger.info("Deserializing #{file}")
     yaml = YAML.load(file)
-    return unless yaml
+    if not yaml
+      @logger.error("Unable to parse #{file}")
+      return
+    end
 
-    @users.clear
     @channels.clear
-
     yaml['channels'].each do |c|
       channel = Channel.deserialize(self, c)
       @channels[channel.name] = channel
     end
 
+    @users.clear
     yaml['users'].each do |u|
       user = User.deserialize(self, u)
       @users[user.jid] = user
     end
 
-    puts "loaded #{@channels.size} channel(s) and #{@users.size} user(s)"
+    @logger.info(
+      "Loaded #{@channels.size} channel(s) and #{@users.size} user(s)")
   end
 
   def handle_presence(presence)
-    puts "got presence: #{presence}"
   end
 
   def handle_subscription_request(item, presence)
-    puts "got subscription request from #{presence.from}"
+    @logger.info("Accepting subscription request from #{presence.from}")
     @roster.accept_subscription(presence.from)
   end
 
   def handle_message(message)
-    puts "got message: #{message}"
     return if message.type == :error or not message.body
 
     user = get_user(message.from.to_s)
@@ -457,15 +471,23 @@ class SmartyChat
 end
 
 
+# Crash if a thread sees an exception.
+Thread.abort_on_exception = true
+
+# Create a logger for xmpp4r to use.
+jabber_logger = Logger.new('jabber.log')
+jabber_logger.level = Logger::DEBUG
+Jabber::logger = jabber_logger
+Jabber::debug = true
+
 (jid, password) = File.open(AUTHFILE) {|f| f.readline.split }
-chat = SmartyChat.new(jid, password)
+chat = SmartyChat.new(jid, password, Logger.new('chat.log'))
 
 if File.exists?('state.yaml')
   File.open('state.yaml', 'r') {|f| chat.deserialize(f) }
 end
 
 serialize = Proc.new do
-  puts 'serializing state'
   File.open('state.yaml', 'w') {|f| chat.serialize(f) }
 end
 Kernel.trap('USR1', serialize)
