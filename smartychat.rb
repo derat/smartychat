@@ -102,11 +102,6 @@ class User
     @welcome_sent = false
   end
 
-  def fullname
-    return @jid if @nick == @jid
-    "#@nick (#@jid)"
-  end
-
   def change_nick(new_nick)
     return false if not new_nick =~ /^[-_.a-zA-Z0-9]+$/
     @nick = new_nick
@@ -196,7 +191,7 @@ end
 
 
 class SmartyChat
-  attr_reader :state_mutex
+  attr_reader :state_mutex, :commands
   attr_accessor :sender, :logger
 
   def initialize(jid, password, state_file, logger=nil)
@@ -224,6 +219,7 @@ class SmartyChat
       'help'  => HelpCommand,
       'join'  => JoinCommand,
       'list'  => ListCommand,
+      'me'    => MeCommand,
       'part'  => PartCommand,
     }
 
@@ -356,7 +352,7 @@ class SmartyChat
         if not user.welcome_sent
           user.send_welcome
         else
-          user.enqueue_message('_You need to join a channel first_')
+          user.enqueue_message('_You need to join a channel first._')
         end
       end
     end
@@ -364,7 +360,7 @@ class SmartyChat
 
   def handle_command(user, text)
     if not %r!^/([a-z]+)\s*(.*)! =~ text
-      user.enqueue_message('_Unparsable command; try */help*_')
+      user.enqueue_message('_Unparsable command; try */help*._')
       return
     end
 
@@ -373,7 +369,7 @@ class SmartyChat
     if cmd
       cmd.new(self, user, arg).run
     else
-      user.enqueue_message("_Unknown command \"#{cmd_name}\"; try */help*_")
+      user.enqueue_message("_Unknown command \"#{cmd_name}\"; try */help*._")
     end
   end
 
@@ -390,29 +386,33 @@ class SmartyChat
     def status(text)
       @user.enqueue_message('_' + text + '_')
     end
+
+    def Command.usage
+      return ['[arg1] [arg2] ...', 'Description of command.']
+    end
   end
 
   class AliasCommand < Command
     def run
       parts = CSV::parse_line(@arg, ' ')
       if parts.size != 1
-        status("*/alias* requires 1 argument; got #{parts.size}")
+        status("*/alias* requires 1 argument; got #{parts.size}.")
         return
       end
 
       nick = parts[0].to_s
       if @user.nick == nick
-        status("Your alias is already set to #{nick}")
+        status("Your alias is already set to #{nick}.")
         return
       end
 
       existing_user = @chat.get_user_with_nick(nick)
       if existing_user
-        status("Alias \"#{nick}\" already in use by #{existing_user.jid}")
+        status("Alias \"#{nick}\" already in use by #{existing_user.jid}.")
         return
       end
 
-      oldname = @user.fullname
+      old_nick = @user.nick
       success = false
       @chat.state_mutex.synchronize do
         success = @user.change_nick(nick)
@@ -421,17 +421,31 @@ class SmartyChat
 
       if success
         if @user.channel
-          @user.channel.broadcast_message("_#{oldname} is now known as #{@user.nick}_")
+          @user.channel.broadcast_message(
+            "_*#{old_nick}* (#{@user.jid}) is now known as *#{@user.nick}*._")
         end
       else
-        status("Invalid alias \"#{parts[0]}\"")
+        status("Invalid alias \"#{parts[0]}\".")
       end
+    end
+
+    def AliasCommand.usage
+      return ['[name]', 'Choose a display name.']
     end
   end
 
   class HelpCommand < Command
     def run
-      @user.enqueue_message('Help isn\'t written yet. :-(')
+      cmds = @chat.commands.collect do |name, cmd|
+        args, desc = cmd.usage
+        "*/#{name}#{args ? ' ' + args : ''}* - #{desc}"
+      end
+      text = cmds.sort.join("\n")
+      @user.enqueue_message("Commands:\n#{text}")
+    end
+
+    def HelpCommand.usage
+      return [nil, 'Display this message.']
     end
   end
 
@@ -439,7 +453,7 @@ class SmartyChat
     def run
       parts = CSV::parse_line(@arg, ' ')
       if parts.empty? or parts.size > 2
-        status("*/join* requires 1 or 2 arguments; got #{parts.size}")
+        status("*/join* requires 1 or 2 arguments; got #{parts.size}.")
         return
       end
 
@@ -453,30 +467,36 @@ class SmartyChat
           channel.password = password
           @chat.inc_version
         end
-        status("Created channel #{name}")
+        status("Created \"#{name}\".")
       end
 
       if channel.password and password != channel.password
-        status("Incorrect or missing password for channel #{name}")
+        status("Incorrect or missing password for \"#{name}\".")
         return
       end
 
       if @user.channel == channel
-        status("Already a member of channel #{name}")
+        status("Already a member of \"#{name}\".")
         return
       end
 
       PartCommand.new(@chat, @user, '').run if @user.channel
       channel.broadcast_message(
-        "_#{@user.fullname} has joined #{channel.name}_")
+        "_*#{@user.nick}* (#{@user.jid}) has joined \"#{channel.name}\"._")
       @chat.state_mutex.synchronize do
         channel.add_user(@user)
         @user.channel = channel
         @chat.inc_version
       end
 
-      status("Joined channel #{name} with #{channel.users.size} user" +
-             (channel.users.size == 1 ? '' : 's'))
+      status("Joined \"#{name}\" with #{channel.users.size} user" +
+             (channel.users.size == 1 ? '' : 's') + ' total.')
+    end
+
+    def JoinCommand.usage
+      return ['[name] [password]',
+              'Join a channel, creating it if it doesn\'t exist. ' +
+              'Password is optional.']
     end
   end
 
@@ -484,18 +504,42 @@ class SmartyChat
     def run
       channel = @user.channel
       if not channel
-        status("Not currently in a channel")
+        status('Not currently in a channel.')
         return
       end
 
       out = "#{channel.users.size} user" +
         (channel.users.size == 1 ? '' : 's') +
-        " in #{channel.name}:\n"
+        " in \"#{channel.name}\":\n"
       channel.users.each do |u|
-        out += "* #{u.fullname}\n"
+        out += "*#{u.nick}* (#{u.jid})\n"
       end
 
       @user.enqueue_message(out)
+    end
+
+    def ListCommand.usage
+      return [nil, 'List users in the current channel.']
+    end
+  end
+
+  class MeCommand < Command
+    def run
+      text = @arg.strip
+      if text.empty?
+        status('Expected some descriptive text.')
+        return
+      end
+
+      if not @user.channel
+        status('Not currently in a channel.')
+      end
+
+      @user.channel.broadcast_message("_* #{@user.nick} #{text}_")
+    end
+
+    def MeCommand.usage
+      return ['[description]', 'Announce what you\'re doing.']
     end
   end
 
@@ -503,7 +547,7 @@ class SmartyChat
     def run
       channel = @user.channel
       if not channel
-        status("Not currently in a channel")
+        status('Not currently in a channel.')
         return
       end
 
@@ -513,9 +557,13 @@ class SmartyChat
         @chat.inc_version
       end
 
-      status("Left channel #{channel.name}")
+      status("Left \"#{channel.name}\".")
       channel.broadcast_message(
-        "_#{@user.fullname} has left #{channel.name}_")
+        "_*#{@user.nick}* (#{@user.jid}) has left #{channel.name}._")
+    end
+
+    def PartCommand.usage
+      return [nil, 'Leave the current channel.']
     end
   end
 end
