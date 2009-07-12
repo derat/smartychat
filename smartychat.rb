@@ -1,4 +1,10 @@
 #!/usr/bin/ruby
+# XMPP (Jabber) group chat bot
+# Written by Daniel Erat <dan-smartychat@erat.org> on 20090711.
+#
+# License: "freeware", "public domain", etc.  Do whatever you want with it.
+# Don't blame me for anything it does (to the point that that's permitted
+# by law). :-P
 
 require 'csv'  # for quoted-string splitting!
 require 'logger'
