@@ -174,7 +174,7 @@ class Channel
 
   # Repeat a typed message to all users except the one who sent it.
   def repeat_message(sender, body)
-    text = "#{sender.nick}: #{body}"
+    text = "*#{sender.nick}:* #{body}"
     @users.each do |u|
       next if u == sender
       u.enqueue_message(text)
@@ -398,7 +398,7 @@ class SmartyChat
     else
       if user.channel
         user.channel.repeat_message(user, message.body)
-        if message.body =~ /\b(.+)(\+\+|--)($|\s+(.*))/
+        if message.body =~ /\b(\S+)(\+\+|--)($|\s+(.*))/
           if $2 == '++'
             user.channel.increment_score($1, $4)
           else
