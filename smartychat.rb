@@ -10,7 +10,8 @@ require 'xmpp4r/presence'
 require 'xmpp4r/roster'
 require 'yaml'
 
-AUTHFILE = "#{ENV['HOME']}/.smartychat_auth"
+AUTH_FILE  = "#{ENV['HOME']}/.smartychat_auth"
+STATE_FILE = "#{ENV['HOME']}/.smartychat_state"
 
 
 class MessageSender
@@ -28,11 +29,7 @@ class MessageSender
     @queued_messages_mutex = Mutex.new
     @queued_messages_condition = ConditionVariable.new
 
-    @thread = Thread.new do
-      loop do
-        send_queued_messages
-      end
-    end
+    @thread = Thread.new { loop { send_queued_messages } }
   end
 
   def enqueue_message(jid, text)
@@ -44,20 +41,19 @@ class MessageSender
         @queued_messages[jid] = msg_list
       end
       msg_list << text
-    end
 
-    # Wake up send_queued_messages().
-    @queued_messages_condition.broadcast
+      # Wake up send_queued_messages().
+      @queued_messages_condition.broadcast
+    end
   end
 
   def send_queued_messages
     # Wait until there are some queued messages.
+    @logger.debug('Waiting for new messages')
     @queued_messages_mutex.synchronize do
-      break if not @queued_messages.empty?
       loop do
-        @logger.debug('Waiting for new messages')
-        @queued_messages_condition.wait @queued_messages_mutex
         break if not @queued_messages.empty?
+        @queued_messages_condition.wait @queued_messages_mutex
       end
     end
 
@@ -104,9 +100,6 @@ class User
     end
     @channel = nil
     @welcome_sent = false
-
-    @queued_messages = []
-    @queued_messages_mutex = Mutex.new
   end
 
   def fullname
@@ -203,9 +196,10 @@ end
 
 
 class SmartyChat
-  attr_accessor :sender
+  attr_reader :state_mutex
+  attr_accessor :sender, :logger
 
-  def initialize(jid, password, logger=nil)
+  def initialize(jid, password, state_file, logger=nil)
     @client = Jabber::Client.new(Jabber::JID.new(jid))
     @client.connect
     @client.auth(password)
@@ -235,11 +229,26 @@ class SmartyChat
 
     @logger = logger ? logger : Logger.new(STDOUT)
     @sender = MessageSender.new(@client, 2, @logger)
+
+    @current_version = 0
+    @saved_version = 0
+
+    @state_mutex = Mutex.new
+    @current_version_condition = ConditionVariable.new
+
+    @state_file = state_file
+    if File.exists?(@state_file)
+      @state_mutex.synchronize do
+        File.open(@state_file, 'r') {|f| deserialize(f) }
+      end
+    end
+
+    @save_thread = Thread.new { loop { save_state_when_changed } }
   end
 
-  def logger=(logger)
-    @logger = logger
-    @sender.logger = logger
+  def inc_version
+    @current_version += 1
+    @current_version_condition.broadcast
   end
 
   # Look up a user from their JID.  A new User object is created if
@@ -273,13 +282,12 @@ class SmartyChat
     return nil
   end
 
-  def serialize(file)
-    @logger.info("Serializing to #{file}")
+  def serialize()
     data = {
       'channels' => @channels.values.collect {|c| c.serialize },
       'users' => @users.values.collect {|u| u.serialize },
     }
-    file.write(data.to_yaml)
+    data.to_yaml
   end
 
   def deserialize(file)
@@ -304,6 +312,26 @@ class SmartyChat
 
     @logger.info(
       "Loaded #{@channels.size} channel(s) and #{@users.size} user(s)")
+  end
+
+  def save_state_when_changed
+    data = ''
+    @state_mutex.synchronize do
+      loop do
+        break if @current_version > @saved_version
+        @logger.debug("Waiting for state change at version #@current_version")
+        @current_version_condition.wait @state_mutex
+      end
+
+      # TODO: rate-limit?
+      data = serialize
+      @saved_version = @current_version
+    end
+
+    @logger.info("Writing state at version #@saved_version to #@state_file")
+    tmpfile = @state_file + '.tmp'
+    File.open(tmpfile, File::CREAT|File::RDWR) {|f| f.write(data) }
+    File.rename(tmpfile, @state_file)
   end
 
   def handle_presence(presence)
@@ -372,14 +400,26 @@ class SmartyChat
         return
       end
 
-      existing_user = @chat.get_user_with_nick(parts[0])
+      nick = parts[0].to_s
+      if @user.nick == nick
+        status("Your alias is already set to #{nick}")
+        return
+      end
+
+      existing_user = @chat.get_user_with_nick(nick)
       if existing_user
-        status("Alias \"#{parts[0]}\" already in use by #{existing_user.jid}")
+        status("Alias \"#{nick}\" already in use by #{existing_user.jid}")
         return
       end
 
       oldname = @user.fullname
-      if @user.change_nick(parts[0])
+      success = false
+      @chat.state_mutex.synchronize do
+        success = @user.change_nick(nick)
+        @chat.inc_version if success
+      end
+
+      if success
         if @user.channel
           @user.channel.broadcast_message("_#{oldname} is now known as #{@user.nick}_")
         end
@@ -403,13 +443,16 @@ class SmartyChat
         return
       end
 
-      name = parts[0]
-      password = (parts.size == 2 ? parts[1] : nil)
+      name = parts[0].to_s
+      password = (parts.size == 2 ? parts[1].to_s : nil)
 
       channel = @chat.get_channel(name, false)
       if not channel
-        channel = @chat.get_channel(name, true)
-        channel.password = password
+        @chat.state_mutex.synchronize do
+          channel = @chat.get_channel(name, true)
+          channel.password = password
+          @chat.inc_version
+        end
         status("Created channel #{name}")
       end
 
@@ -426,8 +469,11 @@ class SmartyChat
       PartCommand.new(@chat, @user, '').run if @user.channel
       channel.broadcast_message(
         "_#{@user.fullname} has joined #{channel.name}_")
-      channel.add_user(@user)
-      @user.channel = channel
+      @chat.state_mutex.synchronize do
+        channel.add_user(@user)
+        @user.channel = channel
+        @chat.inc_version
+      end
 
       status("Joined channel #{name} with #{channel.users.size} user" +
              (channel.users.size == 1 ? '' : 's'))
@@ -461,11 +507,15 @@ class SmartyChat
         return
       end
 
-      channel.remove_user(@user)
+      @chat.state_mutex.synchronize do
+        channel.remove_user(@user)
+        @user.channel = nil
+        @chat.inc_version
+      end
+
       status("Left channel #{channel.name}")
       channel.broadcast_message(
         "_#{@user.fullname} has left #{channel.name}_")
-      @user.channel = nil
     end
   end
 end
@@ -480,17 +530,8 @@ jabber_logger.level = Logger::DEBUG
 Jabber::logger = jabber_logger
 Jabber::debug = true
 
-(jid, password) = File.open(AUTHFILE) {|f| f.readline.split }
-chat = SmartyChat.new(jid, password, Logger.new('chat.log'))
-
-if File.exists?('state.yaml')
-  File.open('state.yaml', 'r') {|f| chat.deserialize(f) }
-end
-
-serialize = Proc.new do
-  File.open('state.yaml', 'w') {|f| chat.serialize(f) }
-end
-Kernel.trap('USR1', serialize)
+(jid, password) = File.open(AUTH_FILE) {|f| f.readline.split }
+chat = SmartyChat.new(jid, password, STATE_FILE, Logger.new('chat.log'))
 
 # Put the main thread in sleep mode (the parser thread will still get
 # scheduled).
