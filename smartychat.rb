@@ -14,6 +14,8 @@ AUTH_FILE  = "#{ENV['HOME']}/.smartychat_auth"
 STATE_FILE = "#{ENV['HOME']}/.smartychat_state"
 
 
+# Queues messages, batching them together per-user before sending.
+# This attempts to avoid hitting rate limits.
 class MessageSender
   attr_accessor :logger
 
@@ -87,6 +89,7 @@ class MessageSender
 end
 
 
+# A single user.  Each JID has a User object associated with it.
 class User
   attr_reader :jid, :nick
   attr_accessor :channel, :welcome_sent
@@ -102,6 +105,7 @@ class User
     @welcome_sent = false
   end
 
+  # Change the user's nick.  Returns false for invalid names.
   def change_nick(new_nick)
     return false if not new_nick =~ /^[-_.a-zA-Z0-9]+$/
     @nick = new_nick
@@ -121,6 +125,7 @@ class User
     @welcome_sent = true
   end
 
+  # Get the user's state as a Hash that can be restored later.
   def serialize
     {
       'jid' => @jid,
@@ -129,6 +134,8 @@ class User
     }
   end
 
+  # Construct a new user from the data returned by serialize().
+  # If the user was subscribed to a channel, they are re-added to it.
   def User.deserialize(chat, struct)
     user = User.new(chat.sender, struct['jid'], struct['nick'])
     if struct['channel_name']
@@ -141,6 +148,7 @@ class User
 end
 
 
+# A channel where users can chat.
 class Channel
   attr_reader :name, :users
   attr_accessor :password
@@ -161,6 +169,7 @@ class Channel
     @users.delete(user)
   end
 
+  # Repeat a typed message to all users except the one who sent it.
   def repeat_message(sender, body)
     text = "[#{sender.nick}]: #{body}"
     @users.each do |u|
@@ -169,10 +178,12 @@ class Channel
     end
   end
 
+  # Broadcast a message to all users in the channel.
   def broadcast_message(text)
     @users.each {|u| u.enqueue_message(text) }
   end
 
+  # Get the channel's state as a Hash that can be restored later.
   def serialize
     {
       'name' => @name,
@@ -180,6 +191,7 @@ class Channel
     }
   end
 
+  # Construct a new channel from the data returned by serialize().
   def Channel.deserialize(chat, struct)
     channel = Channel.new(struct['name'])
     if struct['password'] and not struct['password'].empty?
@@ -235,7 +247,10 @@ class SmartyChat
     @state_file = state_file
     if File.exists?(@state_file)
       @state_mutex.synchronize do
-        File.open(@state_file, 'r') {|f| deserialize(f) }
+        File.open(@state_file, 'r') do |f|
+          deserialize(f) or raise RuntimeError.new(
+            "Unable to load state from #@state_file.")
+        end
       end
     end
 
@@ -258,6 +273,8 @@ class SmartyChat
     user
   end
 
+  # Look up a channel from its name.  If 'create' is true, the channel will
+  # be created if it doesn't exist.
   def get_channel(name, create)
     channel = @channels[name]
     if not channel
@@ -271,13 +288,15 @@ class SmartyChat
     channel
   end
 
+  # Get the user with the passed-in nickname.
   def get_user_with_nick(nick)
     @users.values.each do |u|
       return u if u.nick == nick
     end
-    return nil
+    nil
   end
 
+  # Get the chat system's state as a string that can be restored later.
   def serialize()
     data = {
       'channels' => @channels.values.collect {|c| c.serialize },
@@ -286,12 +305,14 @@ class SmartyChat
     data.to_yaml
   end
 
+  # Restore the chat system's state from a file.
+  # Returns false on failure.
   def deserialize(file)
     @logger.info("Deserializing #{file}")
     yaml = YAML.load(file)
     if not yaml
       @logger.error("Unable to parse #{file}")
-      return
+      return false
     end
 
     @channels.clear
@@ -308,6 +329,7 @@ class SmartyChat
 
     @logger.info(
       "Loaded #{@channels.size} channel(s) and #{@users.size} user(s)")
+    true
   end
 
   def save_state_when_changed
