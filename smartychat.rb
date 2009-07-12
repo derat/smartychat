@@ -150,13 +150,16 @@ end
 
 # A channel where users can chat.
 class Channel
-  attr_reader :name, :users
+  attr_reader :name, :users, :scores
   attr_accessor :password
 
   def initialize(name)
     @name = name
     @users = []
     @password = nil
+
+    # String => Integer
+    @scores = {}
   end
 
   def add_user(user)
@@ -183,11 +186,34 @@ class Channel
     @users.each {|u| u.enqueue_message(text) }
   end
 
+  def increment_score(item, note=nil)
+    words = %w{Hooray! Yay!}
+    exclamation = words[rand(words.size)]
+    @scores[item] = 0 if not @scores[item]
+    @scores[item] += 1
+
+    broadcast_message(
+      "_#{exclamation} #{item} -> #{@scores[item]}" +
+      "#{note ? " (#{note})" : ''}_")
+  end
+
+  def decrement_score(item, note=nil)
+    words = %w{Ouch! Zing!}
+    exclamation = words[rand(words.size)]
+    @scores[item] = 0 if not @scores[item]
+    @scores[item] -= 1
+
+    broadcast_message(
+      "_#{exclamation} #{item} -> #{@scores[item]}" +
+      "#{note ? " (#{note})" : ''}_")
+  end
+
   # Get the channel's state as a Hash that can be restored later.
   def serialize
     {
       'name' => @name,
       'password' => @password,
+      'scores' => @scores,
     }
   end
 
@@ -197,6 +223,7 @@ class Channel
     if struct['password'] and not struct['password'].empty?
       channel.password = struct['password']
     end
+    # TODO: Restore scores, maybe.
     channel
   end
 end
@@ -227,12 +254,13 @@ class SmartyChat
     @channels = {}
 
     @commands = {
-      'alias' => AliasCommand,
-      'help'  => HelpCommand,
-      'join'  => JoinCommand,
-      'list'  => ListCommand,
-      'me'    => MeCommand,
-      'part'  => PartCommand,
+      'alias'  => AliasCommand,
+      'help'   => HelpCommand,
+      'join'   => JoinCommand,
+      'list'   => ListCommand,
+      'me'     => MeCommand,
+      'part'   => PartCommand,
+      'scores' => ScoresCommand,
     }
 
     @logger = logger ? logger : Logger.new(STDOUT)
@@ -370,6 +398,13 @@ class SmartyChat
     else
       if user.channel
         user.channel.repeat_message(user, message.body)
+        if message.body =~ /\b(.+)(\+\+|--)($|\s+(.*))/
+          if $2 == '++'
+            user.channel.increment_score($1, $4)
+          else
+            user.channel.decrement_score($1, $4)
+          end
+        end
       else
         if not user.welcome_sent
           user.send_welcome
@@ -586,6 +621,26 @@ class SmartyChat
 
     def PartCommand.usage
       return [nil, 'Leave the current channel.']
+    end
+  end
+
+  class ScoresCommand < Command
+    def run
+      if not @user.channel
+        status('Not currently in a channel.')
+        return
+      end
+
+      lines = []
+      @user.channel.scores.each do |name, score|
+        lines << "*#{name}*: #{score}"
+      end
+      out = "Scores for \"#{@user.channel.name}\":\n#{lines.join("\n")}"
+      @user.enqueue_message(out)
+    end
+
+    def ScoresCommand.usage
+      return [nil, 'List scores in the current channel.']
     end
   end
 end
