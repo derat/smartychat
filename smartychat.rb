@@ -174,7 +174,7 @@ class Channel
 
   # Repeat a typed message to all users except the one who sent it.
   def repeat_message(sender, body)
-    text = "[#{sender.nick}]: #{body}"
+    text = "#{sender.nick}: #{body}"
     @users.each do |u|
       next if u == sender
       u.enqueue_message(text)
