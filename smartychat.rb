@@ -446,12 +446,14 @@ class SmartyChat
   end
 
   def handle_command(user, text)
-    if not %r!^/([a-z]+)\s*(.*)! =~ text
+    if not %r!^/([a-z]+)($|\s+(.*))! =~ text
       user.enqueue_message('_Unparsable command; try */help*._')
       return
     end
 
-    cmd_name, arg = $1, $2
+    cmd_name = $1
+    arg = $3 ? $3.strip : ''
+
     cmd = @commands[cmd_name]
     if cmd
       cmd.new(self, user, arg).run
@@ -460,6 +462,7 @@ class SmartyChat
     end
   end
 
+  # Base class for '/' commands.
   class Command
     def initialize(chat, user, arg)
       @chat = chat
@@ -470,8 +473,18 @@ class SmartyChat
     def run
     end
 
+    # Helper method for sending an italicized message to the user.
     def status(text)
       @user.enqueue_message('_' + text + '_')
+    end
+
+    # Split the passed-in string into an array of strings, respecting
+    # double-quoting.
+    def split_args(str)
+      # We need to handle empty strings ourselves; CSV.parse_line() will
+      # return [nil].
+      return [] if not str or str.empty?
+      return CSV.parse_line(str, ' ').map {|i| i.to_s }
     end
 
     def Command.usage
@@ -481,7 +494,7 @@ class SmartyChat
 
   class AliasCommand < Command
     def run
-      parts = CSV::parse_line(@arg, ' ')
+      parts = split_args(@arg)
       if parts.size != 1
         status("*/alias* requires 1 argument; got #{parts.size}.")
         return
@@ -538,7 +551,7 @@ class SmartyChat
 
   class JoinCommand < Command
     def run
-      parts = CSV::parse_line(@arg, ' ')
+      parts = split_args(@arg)
       if parts.empty? or parts.size > 2
         status("*/join* requires 1 or 2 arguments; got #{parts.size}.")
         return
