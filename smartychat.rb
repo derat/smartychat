@@ -19,7 +19,7 @@ STATE_FILE = "#{ENV['HOME']}/.smartychat_state"
 class MessageSender
   attr_accessor :logger
 
-  def initialize(client, interval_sec=2, logger=nil)
+  def initialize(client, interval_sec=1, logger=nil)
     @client = client
     @interval_sec = interval_sec
 
@@ -264,7 +264,7 @@ class SmartyChat
     }
 
     @logger = logger ? logger : Logger.new(STDOUT)
-    @sender = MessageSender.new(@client, 2, @logger)
+    @sender = MessageSender.new(@client, 1, @logger)
 
     @current_version = 0
     @saved_version = 0
