@@ -213,7 +213,7 @@ class Channel
     {
       'name' => @name,
       'password' => @password,
-      'scores' => @scores,
+      'scores' => Hash[*(@scores.find_all {|k,v| v != 0 }.flatten)],
     }
   end
 
@@ -223,7 +223,7 @@ class Channel
     if struct['password'] and not struct['password'].empty?
       channel.password = struct['password']
     end
-    # TODO: Restore scores, maybe.
+    struct['scores'].each {|k,v| channel.scores[k] = v.to_i }
     channel
   end
 end
@@ -408,6 +408,7 @@ class SmartyChat
           else
             user.channel.decrement_score($1, $4)
           end
+          @state_mutex.synchronize { inc_version }
         end
       else
         if not user.welcome_sent
