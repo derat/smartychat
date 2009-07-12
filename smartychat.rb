@@ -293,6 +293,10 @@ class SmartyChat
   # Look up a user from their JID.  A new User object is created if
   # necessary.
   def get_user(jid)
+    # Drop the resource.
+    parts = jid.to_s.split('/')
+    jid = parts[0]
+
     user = @users[jid]
     if not user
       user = User.new(@sender, jid)
