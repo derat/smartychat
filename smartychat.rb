@@ -283,6 +283,8 @@ class SmartyChat
     end
 
     @save_thread = Thread.new { loop { save_state_when_changed } }
+    @save_interval = 10  # Wait at least 10 sec between saving state.
+    @last_save_time = 0
   end
 
   def inc_version
@@ -364,18 +366,35 @@ class SmartyChat
     true
   end
 
+  # Block until the state changes (determined by waiting on
+  # @current_version_condition) and then write it to disk.
   def save_state_when_changed
-    data = ''
     @state_mutex.synchronize do
       loop do
         break if @current_version > @saved_version
         @logger.debug("Waiting for state change at version #@current_version")
         @current_version_condition.wait @state_mutex
       end
+    end
 
-      # TODO: rate-limit?
+    # Wait a bit if we wrote the previous data recently.
+    time_to_sleep = [@save_interval - (Time.now.to_f - @last_save_time), 0].max
+    @logger.debug("Sleeping #{time_to_sleep} sec before writing state")
+    sleep(time_to_sleep)
+
+    # We know that the version's changed, so this should always do a write.
+    save_state_if_changed
+  end
+
+  # Save the state to disk if it's changed, returning without writing
+  # anything if it hasn't.
+  def save_state_if_changed
+    data = ''
+    @state_mutex.synchronize do
+      return if @current_version == @saved_version
       data = serialize
       @saved_version = @current_version
+      @last_save_time = Time.now.to_f
     end
 
     @logger.info("Writing state at version #@saved_version to #@state_file")
@@ -662,6 +681,16 @@ Jabber::debug = true
 
 (jid, password) = File.open(AUTH_FILE) {|f| f.readline.split }
 chat = SmartyChat.new(jid, password, STATE_FILE, Logger.new('chat.log'))
+
+# Install some signal handlers.
+save_and_exit = Proc.new do
+  $stderr.print 'Saving state before exiting... '
+  chat.save_state_if_changed
+  $stderr.puts 'done.'
+  Kernel.exit!(0)
+end
+Kernel.trap('INT', save_and_exit)
+Kernel.trap('TERM', save_and_exit)
 
 # Put the main thread in sleep mode (the parser thread will still get
 # scheduled).
