@@ -2,7 +2,7 @@
 
 EMAIL=dan@erat.org
 NAME=smartychat.rb
-FILE=$HOME/.smartychat_alert
+FILE=$HOME/smartychat/.smartychat_alert
 REPEAT_MINUTES=360
 
 if ! ps wwaux | grep -v grep | fgrep -q "$NAME"; then
