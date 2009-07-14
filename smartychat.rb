@@ -16,8 +16,8 @@ require 'xmpp4r/presence'
 require 'xmpp4r/roster'
 require 'yaml'
 
-AUTH_FILE  = "#{ENV['HOME']}/.smartychat_auth"
-STATE_FILE = "#{ENV['HOME']}/.smartychat_state"
+AUTH_FILE  = '.smartychat_auth'
+STATE_FILE = '.smartychat_state'
 
 
 # Queues messages, batching them together per-user before sending.
