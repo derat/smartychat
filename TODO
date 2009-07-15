@@ -1,0 +1,6 @@
+- "vamos" handling
+- can end up with duplicate auto-assigned aliases
+  (from e.g. user@a.com and user@b.com)
+- drop channels when empty
+- sort by alias for /list
+- use angled brackets instead of parentheses for JIDs?
