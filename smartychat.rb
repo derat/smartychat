@@ -100,22 +100,23 @@ class User
   attr_reader :jid, :nick
   attr_accessor :channel, :welcome_sent
 
-  def initialize(sender, jid, nick=nil)
+  def initialize(sender, jid, nick)
     @sender = sender
-    @jid = jid
-    @nick = (nick or jid)
-    if @nick == jid and /^([^@]+)/ =~ jid
-      @nick = $1
-    end
+    @jid = jid.to_s
+    @nick = User.valid_nick?(nick) ? nick.to_s : @jid
     @channel = nil
     @welcome_sent = false
   end
 
   # Change the user's nick.  Returns false for invalid names.
   def change_nick(new_nick)
-    return false if not new_nick =~ /^[-_.a-zA-Z0-9]+$/
-    @nick = new_nick
-    return true
+    return false if not User.valid_nick?(new_nick)
+    @nick = new_nick.to_s
+    true
+  end
+
+  def User.valid_nick?(proposed_nick)
+    proposed_nick.to_s =~ /^[-_.a-zA-Z0-9]+$/ ? true : false
   end
 
   def enqueue_message(text)
@@ -270,6 +271,11 @@ class SmartyChat
       'scores' => ScoresCommand,
     }
 
+    @line_handlers = [
+      PlusPlusHandler,
+      VamosQuestionHandler,
+    ]
+
     @logger = logger ? logger : Logger.new(STDOUT)
     @sender = MessageSender.new(@client, 0.5, @logger)
 
@@ -296,20 +302,23 @@ class SmartyChat
 
   def inc_version
     @current_version += 1
+    @logger.debug("Incremented version to #@current_version")
     @current_version_condition.broadcast
   end
 
-  # Look up a user from their JID.  A new User object is created if
+  # Look up a user from their JID.  If 'create' is true, the user will be
+  # created if they don't exist.
   # necessary.
-  def get_user(jid)
+  def get_user(jid, create)
     # Drop the resource.
     parts = jid.to_s.split('/')
     jid = parts[0]
 
     user = @users[jid]
-    if not user
-      user = User.new(@sender, jid)
+    if not user and create
+      user = User.new(@sender, jid, invent_nick(jid))
       @users[jid] = user
+      @logger.debug("Created user #{user.nick} <#{user.jid}>")
     end
     user
   end
@@ -318,15 +327,19 @@ class SmartyChat
   # be created if it doesn't exist.
   def get_channel(name, create)
     channel = @channels[name]
-    if not channel
-      if not create
-        return nil
-      else
-        channel = Channel.new(name)
-        @channels[name] = channel
-      end
+    if not channel and create
+      channel = Channel.new(name)
+      @channels[name] = channel
+      @logger.debug("Created channel #{name}")
     end
     channel
+  end
+
+  def delete_channel(name)
+    channel = @channels[name]
+    return if not channel or not channel.users.empty?
+    @channels.delete(name)
+    @logger.debug("Deleted channel #{name}")
   end
 
   # Get the user with the passed-in nickname.
@@ -335,6 +348,18 @@ class SmartyChat
       return u if u.nick == nick
     end
     nil
+  end
+
+  # Generate a unique nick based on a JID.
+  def invent_nick(jid)
+    /^([^@]+)/ =~ jid.to_s
+    return jid if not $1 or not User.valid_nick?($1)
+    return $1 if not get_user_with_nick($1)
+    (2 .. 100).each do |i|
+      new_nick = "#{$1}#{i}"
+      return new_nick if not get_user_with_nick(new_nick)
+    end
+    jid
   end
 
   # Get the chat system's state as a string that can be restored later.
@@ -346,7 +371,7 @@ class SmartyChat
     data.to_yaml
   end
 
-  # Restore the chat system's state frOm a File object.
+  # Restore the chat system's state from a File object.
   # Returns false on failure.
   def deserialize(file)
     @logger.info("Deserializing #{file.path}")
@@ -367,6 +392,8 @@ class SmartyChat
       user = User.deserialize(self, u)
       @users[user.jid] = user
     end
+
+    @channels.each {|n,ch| @channels.delete(n) if ch.users.empty? }
 
     @logger.info(
       "Loaded #{@channels.size} channel(s) and #{@users.size} user(s)")
@@ -406,7 +433,9 @@ class SmartyChat
 
     @logger.info("Writing state at version #@saved_version to #@state_file")
     tmpfile = @state_file + '.tmp'
-    File.open(tmpfile, File::CREAT|File::RDWR, 0600) {|f| f.write(data) }
+    File.open(tmpfile, File::CREAT|File::EXCL|File::RDWR, 0600) do |f|
+      f.write(data)
+    end
     File.rename(tmpfile, @state_file)
   end
 
@@ -421,21 +450,20 @@ class SmartyChat
   def handle_message(message)
     return if message.type == :error or not message.body
 
-    user = get_user(message.from.to_s)
+    user = get_user(message.from.to_s, false)
+    if not user
+      @state_mutex.synchronize do
+        user = get_user(message.from.to_s, true)
+        inc_version
+      end
+    end
 
     if message.body[0,1] == '/'
       handle_command(user, message.body)
     else
       if user.channel
         user.channel.repeat_message(user, message.body)
-        if message.body =~ /\b(\S+)(\+\+|--)($|\s+(.*))/
-          if $2 == '++'
-            user.channel.increment_score($1, $4)
-          else
-            user.channel.decrement_score($1, $4)
-          end
-          @state_mutex.synchronize { inc_version }
-        end
+        @line_handlers.each {|h| h.new(self, user, message.body).run }
       else
         if not user.welcome_sent
           user.send_welcome
@@ -460,6 +488,47 @@ class SmartyChat
       cmd.new(self, user, arg).run
     else
       user.enqueue_message("_Unknown command \"#{cmd_name}\"; try */help*._")
+    end
+  end
+
+  # Base class for things that handle text sent to a channel.
+  # TODO: This overlaps with Command.
+  class LineHandler
+    def initialize(chat, user, text)
+      @chat = chat
+      @user = user
+      @text = text
+    end
+
+    def run
+    end
+
+    # Helper method for sending an italicized message to the user.
+    def status(text)
+      @user.enqueue_message('_' + text + '_')
+    end
+  end
+
+  # Update the score for something in response to a '++' or '--' message.
+  class PlusPlusHandler < LineHandler
+    def run
+      if @text =~ /\b(\S{2,})(\+\+|--)(\s*[.,]?\s+(.*)|\.\s*$|$)/
+        if $2 == '++'
+          @user.channel.increment_score($1, $4)
+        else
+          @user.channel.decrement_score($1, $4)
+        end
+        @chat.state_mutex.synchronize { @chat.inc_version }
+      end
+    end
+  end
+
+  # Scold Julie when she asks, "vamos?".
+  class VamosQuestionHandler < LineHandler
+    def run
+      if @text =~ /\b(¿)?vamos\?\s*$/i
+        status('"vamos" is a statement, not a question!')
+      end
     end
   end
 
@@ -503,7 +572,7 @@ class SmartyChat
 
       nick = parts[0].to_s
       if @user.nick == nick
-        status("Your alias is already set to #{nick}.")
+        status("Your alias is already set to \"#{nick}\".")
         return
       end
 
@@ -523,7 +592,7 @@ class SmartyChat
       if success
         if @user.channel
           @user.channel.broadcast_message(
-            "_*#{old_nick}* (#{@user.jid}) is now known as *#{@user.nick}*._")
+            "_*#{old_nick}* <#{@user.jid}> is now known as *#{@user.nick}*._")
         end
       else
         status("Invalid alias \"#{parts[0]}\".")
@@ -583,7 +652,7 @@ class SmartyChat
 
       PartCommand.new(@chat, @user, '').run if @user.channel
       channel.broadcast_message(
-        "_*#{@user.nick}* (#{@user.jid}) has joined \"#{channel.name}\"._")
+        "_*#{@user.nick}* <#{@user.jid}> has joined \"#{channel.name}\"._")
       @chat.state_mutex.synchronize do
         channel.add_user(@user)
         @user.channel = channel
@@ -611,8 +680,8 @@ class SmartyChat
       out = "#{channel.users.size} user" +
         (channel.users.size == 1 ? '' : 's') +
         " in \"#{channel.name}\":\n"
-      channel.users.each do |u|
-        out += "*#{u.nick}* (#{u.jid})\n"
+      channel.users.sort {|a,b| a.nick <=> b.nick }.each do |u|
+        out += "*#{u.nick}* <#{u.jid}>\n"
       end
 
       @user.enqueue_message(out)
@@ -659,7 +728,14 @@ class SmartyChat
 
       status("Left \"#{channel.name}\".")
       channel.broadcast_message(
-        "_*#{@user.nick}* (#{@user.jid}) has left #{channel.name}._")
+        "_*#{@user.nick}* <#{@user.jid}> has left #{channel.name}._")
+
+      @chat.state_mutex.synchronize do
+        if channel.users.empty?
+          @chat.delete_channel(channel.name)
+          @chat.inc_version
+        end
+      end
     end
 
     def PartCommand.usage
