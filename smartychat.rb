@@ -25,11 +25,17 @@ STATE_FILE = '.smartychat_state'
 class MessageSender
   attr_accessor :logger
 
-  def initialize(client, interval_sec=0.5, logger=nil)
+  # hash args keys:
+  #   :interval_sec => 0.5
+  #   :logger => nil
+  #   :use_separate_messages = false
+  def initialize(client, args)
     @client = client
-    @interval_sec = interval_sec
+    @interval_sec = args[:interval_sec] ? args[:interval_sec].to_i : 0.5
+    @use_separate_messages = args[:use_separate_messages] ? true : false
+    @sender_thread_busy = false
 
-    @logger = logger ? logger : Logger.new(STDOUT)
+    @logger = args[:logger] ? args[:logger] : Logger.new(STDOUT)
     @last_send_time = 0
 
     # JID -> [msg1, msg2, etc.]
@@ -74,6 +80,7 @@ class MessageSender
     @queued_messages_mutex.synchronize do
       messages = @queued_messages
       @queued_messages = {}
+      @sender_thread_busy = true
     end
 
     uncondensed_messages = 0
@@ -81,16 +88,44 @@ class MessageSender
     messages.each do |jid, list|
       next if list.empty?
       uncondensed_messages += list.size
-      body = list.join("\n")
-      msg = Jabber::Message.new(jid, body)
-      msg.type = :chat
-      @client.send(msg)
-      condensed_messages += 1
+      if @use_separate_messages
+        list.each do |body|
+          send_message(jid, body)
+          condensed_messages += 1
+        end
+      else
+        send_message(jid, list.join("\n"))
+        condensed_messages += 1
+      end
     end
 
     @logger.debug("Sent #{condensed_messages} message(s) " +
                   "(#{uncondensed_messages} uncondensed)")
     @last_send_time = Time.now.to_f
+
+    @queued_messages_mutex.synchronize do
+      @sender_thread_busy = false
+      # Wake up wait_until_all_messages_sent().
+      @queued_messages_condition.broadcast
+    end
+  end
+
+  def send_message(jid, body)
+    msg = Jabber::Message.new(jid, body)
+    msg.type = :chat
+    @client.send(msg)
+  end
+  private :send_message
+
+  def wait_until_all_messages_sent
+    @logger.debug('Waiting for all messages to be sent')
+    @queued_messages_mutex.synchronize do
+      loop do
+        break if @queued_messages.empty? and not @sender_thread_busy
+        @queued_messages_condition.wait @queued_messages_mutex
+      end
+    end
+    @logger.debug('Done waiting for all messages to be sent')
   end
 end
 
@@ -240,14 +275,17 @@ class SmartyChat
   attr_reader :state_mutex, :commands
   attr_accessor :sender, :logger
 
-  def initialize(jid, password, state_file, logger=nil)
-    @client = Jabber::Client.new(Jabber::JID.new(jid))
-    @client.connect
-    @client.auth(password)
+  # hash args keys:
+  #   :state_file => nil
+  #   :logger => nil
+  #   :message_buffer_sec => 0.5
+  #   :use_separate_messages => false
+  def initialize(client, roster, args)
+    @client = client
     @client.add_message_callback {|m| handle_message(m) }
     @client.add_presence_callback {|p| handle_presence(p) }
 
-    @roster = Jabber::Roster::Helper.new(@client)
+    @roster = roster
     @roster.add_subscription_request_callback do |item, presence|
       handle_subscription_request(item, presence)
     end
@@ -276,8 +314,14 @@ class SmartyChat
       VamosQuestionHandler,
     ]
 
-    @logger = logger ? logger : Logger.new(STDOUT)
-    @sender = MessageSender.new(@client, 0.5, @logger)
+    @logger = args[:logger] ? args[:logger] : Logger.new(STDOUT)
+    interval_sec = args[:message_buffer_sec] ? args[:message_buffer_sec] : 0.5
+    @sender = MessageSender.new(
+      @client,
+      { :interval_sec => interval_sec,
+        :logger => @logger,
+        :use_separate_messages => args[:use_separate_messages],
+      })
 
     @current_version = 0
     @saved_version = 0
@@ -285,19 +329,21 @@ class SmartyChat
     @state_mutex = Mutex.new
     @current_version_condition = ConditionVariable.new
 
-    @state_file = state_file
-    if File.exists?(@state_file)
-      @state_mutex.synchronize do
-        File.open(@state_file, 'r') do |f|
-          deserialize(f) or raise RuntimeError.new(
-            "Unable to load state from #@state_file.")
+    if args[:state_file]
+      @state_file = args[:state_file]
+      if File.exists?(@state_file)
+        @state_mutex.synchronize do
+          File.open(@state_file, 'r') do |f|
+            deserialize(f) or raise RuntimeError.new(
+              "Unable to load state from #@state_file.")
+          end
         end
       end
-    end
 
-    @save_thread = Thread.new { loop { save_state_when_changed } }
-    @save_interval = 10  # Wait at least 10 sec between saving state.
-    @last_save_time = 0
+      @save_thread = Thread.new { loop { save_state_when_changed } }
+      @save_interval = 10  # Wait at least 10 sec between saving state.
+      @last_save_time = 0
+    end
   end
 
   def inc_version
@@ -360,6 +406,11 @@ class SmartyChat
       return new_nick if not get_user_with_nick(new_nick)
     end
     jid
+  end
+
+  # Wait until all queued messages are sent.  Useful for testing.
+  def wait_until_all_messages_sent
+    @sender.wait_until_all_messages_sent
   end
 
   # Get the chat system's state as a string that can be restored later.
@@ -728,7 +779,7 @@ class SmartyChat
 
       status("Left \"#{channel.name}\".")
       channel.broadcast_message(
-        "_*#{@user.nick}* <#{@user.jid}> has left #{channel.name}._")
+        "_*#{@user.nick}* <#{@user.jid}> has left \"#{channel.name}\"._")
 
       @chat.state_mutex.synchronize do
         if channel.users.empty?
@@ -801,28 +852,38 @@ class SmartyChat
 end
 
 
-# Crash if a thread sees an exception.
-Thread.abort_on_exception = true
+if __FILE__ == $0
+  # Crash if a thread sees an exception.
+  Thread.abort_on_exception = true
 
-# Create a logger for xmpp4r to use.
-jabber_logger = Logger.new('jabber.log')
-jabber_logger.level = Logger::DEBUG
-Jabber::logger = jabber_logger
-Jabber::debug = true
+  # Create a logger for xmpp4r to use.
+  jabber_logger = Logger.new('jabber.log')
+  jabber_logger.level = Logger::DEBUG
+  Jabber::logger = jabber_logger
+  Jabber::debug = true
 
-(jid, password) = File.open(AUTH_FILE) {|f| f.readline.split }
-chat = SmartyChat.new(jid, password, STATE_FILE, Logger.new('chat.log'))
+  (jid, password) = File.open(AUTH_FILE) {|f| f.readline.split }
+  client = Jabber::Client.new(Jabber::JID.new(jid))
+  client.connect
+  client.auth(password)
+  roster = Jabber::Roster::Helper.new(client)
+  chat = SmartyChat.new(
+    client, roster,
+    { :state_file => STATE_FILE,
+      :logger => Logger.new('chat.log'),
+    })
 
-# Install some signal handlers.
-save_and_exit = Proc.new do
-  $stderr.print 'Saving state before exiting... '
-  chat.save_state_if_changed
-  $stderr.puts 'done.'
-  Kernel.exit!(0)
+  # Install some signal handlers.
+  save_and_exit = Proc.new do
+    $stderr.print 'Saving state before exiting... '
+    chat.save_state_if_changed
+    $stderr.puts 'done.'
+    Kernel.exit!(0)
+  end
+  Kernel.trap('INT', save_and_exit)
+  Kernel.trap('TERM', save_and_exit)
+
+  # Put the main thread in sleep mode (the parser thread will still get
+  # scheduled).
+  Thread.stop
 end
-Kernel.trap('INT', save_and_exit)
-Kernel.trap('TERM', save_and_exit)
-
-# Put the main thread in sleep mode (the parser thread will still get
-# scheduled).
-Thread.stop
