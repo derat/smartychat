@@ -138,6 +138,20 @@ class TestSmartychat < Test::Unit::TestCase
     assert_equal(nil, @client.shift_message(jid1))
     assert_equal(nil, @client.shift_message(jid2))
 
+    @client.deliver_message(jid1, '// here is some C++ code')
+    @chat.wait_until_all_messages_sent
+    assert_equal(nil, @client.shift_message(jid1))
+    assert_equal('*foo*: // here is some C++ code',
+                 @client.shift_message(jid2).body)
+    assert_equal(nil, @client.shift_message(jid2))
+
+    @client.deliver_message(jid2, '/bin/ls is a good file')
+    @chat.wait_until_all_messages_sent
+    assert_equal('*bar*: /bin/ls is a good file',
+                 @client.shift_message(jid1).body)
+    assert_equal(nil, @client.shift_message(jid1))
+    assert_equal(nil, @client.shift_message(jid2))
+
     @client.deliver_message(jid1, '/part')
     @chat.wait_until_all_messages_sent
     assert_equal('_Left "#nerds"._', @client.shift_message(jid1).body)

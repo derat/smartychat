@@ -509,7 +509,10 @@ class SmartyChat
       end
     end
 
-    if message.body[0,1] == '/'
+    # Don't interpret C++-style comments or Unix paths as commands.
+    if message.body[0,1] == '/' and
+       message.body !~ /^\/\// and
+       message.body !~ /^\/[a-zA-Z]+\//
       handle_command(user, message.body)
     else
       if user.channel
